@@ -28,7 +28,7 @@ _DEFAULTS = {
     "REFERENCE_GENOME_IMPORTER": "isabl_cli.data.LocalReferenceGenomeImporter",
     "DATA_IMPORTER": "isabl_cli.data.LocalDataImporter",
     "BED_IMPORTER": "isabl_cli.data.LocalBedImporter",
-    "BASE_STORAGE_DIRECTORY": "/work/shah/isabl_data_lake/",
+    "BASE_STORAGE_DIRECTORY": "/temp_area/datadrive/isabl_storage",
     "FASTQ_READ_SUFFIX": "",
     "ADMIN_USER": getpass.getuser(),
     "TIME_ZONE": "America/New_York",
@@ -40,10 +40,6 @@ _DEFAULTS = {
     "ON_DATA_IMPORT": [],
     "ON_STATUS_CHANGE": [],
     "CREATE_SYMLINKS": True,
-    "INSTALLED_APPLICATIONS": [
-       "shahlab_apps.apps.scrna.apps.SCRNA",
-       "shahlab_apps.apps.cellranger.apps.CELLRANGER",
-    ],
     "SUBMIT_MERGE_ANALYSIS": None,
     "ON_SIGNAL_FAILURE": None,
     "ADMIN_COMMANDS": [
