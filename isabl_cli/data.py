@@ -48,6 +48,7 @@ def raw_data_inspector(path):
         (r"\.pdf$", "PDF"),
         (r"\.html$", "HTML"),
         (r"\.md5$", "MD5"),
+        (r"\.y[a]?ml$", "YAML"),
     ]:
         if re.search(i, path):
             return j
@@ -103,7 +104,7 @@ def symlink_experiment_to_projects(experiment):
 
         experiments_dir = join(i["storage_url"], "experiments")
         experiment_dir = join(experiments_dir, experiment["system_id"])
-        os.makedirs(experiments_dir, exist_ok=True)
+        utils.makedirs(experiments_dir)
         utils.force_symlink(experiment["storage_url"], experiment_dir)
 
 
@@ -126,7 +127,7 @@ def symlink_analysis_to_targets(analysis):
             i = update_storage_url("experiments", i["pk"])
 
         analyses_dir = join(i["storage_url"], "analyses")
-        os.makedirs(analyses_dir, exist_ok=True)
+        utils.makedirs(analyses_dir)
         utils.force_symlink(src, join(analyses_dir, dst))
 
     if analysis["project_level_analysis"]:
@@ -135,7 +136,7 @@ def symlink_analysis_to_targets(analysis):
             i = update_storage_url("projects", i["pk"])
 
         analyses_dir = join(i["storage_url"], "analyses")
-        os.makedirs(analyses_dir, exist_ok=True)
+        utils.makedirs(analyses_dir)
         utils.force_symlink(src, join(analyses_dir, dst))
 
 
@@ -248,7 +249,9 @@ def _make_storage_directory(root, base, identifier, use_hash=False):
         path = join(base)
 
     storage_directory = join(root, path, str(identifier))
-    os.makedirs(storage_directory, exist_ok=True, mode=0o770)
+    original_umask = os.umask(0)
+    utils.makedirs(storage_directory)
+    os.umask(original_umask)
     return storage_directory
 
 
@@ -331,7 +334,7 @@ class LocalReferenceDataImporter(BaseImporter):
 
         data_dir = join(instance["storage_url"], sub_dir or data_id)
         data_dst = join(data_dir, basename(data_src))
-        os.makedirs(data_dir, exist_ok=True)
+        utils.makedirs(data_dir)
 
         if symlink:
             cls.echo_src_dst("Linking", data_src, data_dst)
@@ -456,7 +459,10 @@ class LocalReferenceGenomeImporter:
 
                 try:  # pragma: no cover
                     subprocess.check_call(i)
-                except subprocess.CalledProcessError:  # pragma: no cover
+                except (
+                    FileNotFoundError,
+                    subprocess.CalledProcessError,
+                ):  # pragma: no cover
                     click.secho(
                         f"INDEX FAILED, MUST BE FIXED:\n\n\t{' '.join(i)}", fg="red"
                     )
@@ -547,7 +553,7 @@ class LocalBedImporter(BaseImporter):
         base_name = slugify(f'{technique["slug"]}.{assembly}')
         targets_dst = join(beds_dir, f"{base_name}.targets.bed")
         baits_dst = join(beds_dir, f"{base_name}.baits.bed")
-        os.makedirs(beds_dir, exist_ok=True)
+        utils.makedirs(beds_dir)
 
         for src, dst in [(targets_path, targets_dst), (baits_path, baits_dst)]:
             cls.echo_src_dst("Copying", src, dst)
@@ -627,6 +633,8 @@ class LocalDataImporter(BaseImporter):
         key=lambda x: x["system_id"],
         files_data=None,
         dtypes=None,
+        iexact=False,
+        ignore_ownership=False,
         **filters,
     ):
         """
@@ -642,6 +650,8 @@ class LocalDataImporter(BaseImporter):
             key (function): given a experiment dict returns id to match.
             filters (dict): key value pairs to use as API query params.
             dtypes (list): data types that should be matched (e.g. BAM, PNG. etc.).
+            iexact (bool): case insensitive match of identifiers.
+            ignore_ownership (bool): raise error if files not owned by admin user.
             files_data (dict): keys are files basenames and values are
                 dicts with extra annotations such as PL, LB, or any other,
                 see also annotate_file_data.
@@ -688,7 +698,7 @@ class LocalDataImporter(BaseImporter):
                 using_id = f"{i['system_id']} (Skipped, experiment has raw data)"
             elif identifier:
                 identifiers[identifier] = i["system_id"]
-                patterns.append(self.get_regex_pattern(index, identifier))
+                patterns.append(self.get_regex_pattern(index, identifier, iexact))
                 using_id = f"{i['system_id']} (using {identifier})"
 
             cache[index]["using_id"] = using_id
@@ -737,6 +747,13 @@ class LocalDataImporter(BaseImporter):
                                 if match and (not dtypes or match["dtype"] in dtypes):
                                     cache[match.pop("index")]["files"].append(match)
 
+            # check ownership if needed
+            if not ignore_ownership and not symlink:
+                self.check_ownership(cache)
+
+            # check files are readable
+            self.check_are_readable(cache)
+
             # process files if needed
             label = "Processing..."
             bar = sorted(cache.values(), key=lambda x: x["instance"]["pk"])
@@ -756,6 +773,55 @@ class LocalDataImporter(BaseImporter):
 
         return experiments_matched, self.get_summary(cache)
 
+    @staticmethod
+    def check_ownership(cache):
+        """Make sure files matched are owned by current user."""
+        label = "Checking ownership, ignore with --ignore-ownership..."
+        bar = sorted(cache.values(), key=lambda x: x["instance"]["pk"])
+        owner_mismatch = []
+
+        with click.progressbar(bar, label=label) as bar:
+            for i in bar:
+                for j in i["files"]:
+                    try:
+                        utils.assert_same_owner(j["path"])
+                    except AssertionError:
+                        owner_mismatch.append(j["path"])
+
+        if owner_mismatch:
+            raise click.UsageError(
+                click.style(
+                    "The following files are not owned by current user "
+                    "(consider using --ignore-ownership):\n\t",
+                    fg="red",
+                )
+                + "\n\t".join(owner_mismatch)
+            )
+
+    @staticmethod
+    def check_are_readable(cache):
+        """Make sure files matched can be accessed and read."""
+        label = "Checking files are readable..."
+        bar = sorted(cache.values(), key=lambda x: x["instance"]["pk"])
+        unreadable_files = []
+
+        with click.progressbar(bar, label=label) as bar:
+            for i in bar:
+                for j in i["files"]:
+                    try:
+                        assert os.access(j["path"], os.R_OK)
+                    except AssertionError:
+                        unreadable_files.append(j["path"])
+
+        if unreadable_files:
+            raise click.UsageError(
+                click.style(
+                    "The following files are not readable by current user:\n\t",
+                    fg="red",
+                )
+                + "\n\t".join(unreadable_files)
+            )
+
     def match_path(self, path, pattern):
         """Match `path` with `pattern` and update cache if fastq or bam."""
         try:
@@ -767,6 +833,7 @@ class LocalDataImporter(BaseImporter):
             # determine if valid data type
             dtypes = [i(path) for i in self.RAW_DATA_INSPECTORS]
             dtypes = set(i for i in dtypes if i)
+            assert dtypes  # happens if no data type matched
 
             # raise error if multiple data types matched
             if len(dtypes) != 1:
@@ -805,7 +872,7 @@ class LocalDataImporter(BaseImporter):
             )
 
         data_dir = join(instance["storage_url"], "data")
-        os.makedirs(data_dir, exist_ok=True)
+        utils.makedirs(data_dir)
 
         for src, file_type in [(i["path"], i["dtype"]) for i in files]:
             file_name = basename(src)
@@ -842,6 +909,11 @@ class LocalDataImporter(BaseImporter):
             else:
                 self.move(src, dst)
 
+                try:
+                    subprocess.check_call(["chmod", "a-w", dst])
+                except subprocess.CalledProcessError:
+                    pass
+
         return api.patch_instance(
             endpoint="experiments",
             instance_id=instance["pk"],
@@ -851,7 +923,7 @@ class LocalDataImporter(BaseImporter):
         )
 
     @staticmethod
-    def get_regex_pattern(group_name, identifier):
+    def get_regex_pattern(group_name, identifier, iexact=False):
         """
         Get regex pattern for `identifier` group as `group_name`.
 
@@ -860,12 +932,16 @@ class LocalDataImporter(BaseImporter):
         Arguments:
             group_name (str): regex pattern group name.
             identifier (str): identifier to be matched by regex.
+            iexact (bool): use case insensitive match.
 
         Returns:
             str: a regex pattern.
         """
-        pattern = re.sub(r"[-_. ]", r"[-_. ]", identifier)
-        return r"(?P<{}>(^|[-_. ])?{}[-_. ])".format(group_name, pattern)
+        return r"(?P<{}>{}(^|[-_. ])?{}[-_. ])".format(
+            group_name,
+            r"(?i)" if iexact else "",
+            re.sub(r"[-_. ]", r"[-_. ]", identifier),
+        )
 
     @staticmethod
     def get_summary(cache):
@@ -911,7 +987,21 @@ class LocalDataImporter(BaseImporter):
         @click.option(
             "--dtypes", help="Limit data types to be imported.", multiple=True
         )
-        def cmd(identifier, commit, filters, directories, symlink, files_data, dtypes):
+        @click.option(
+            "--iexact", help="Case insensitive match of identifiers.", is_flag=True
+        )
+        @click.option("--ignore-ownership", help="Don't check ownership.", is_flag=True)
+        def cmd(
+            identifier,
+            commit,
+            filters,
+            directories,
+            symlink,
+            files_data,
+            dtypes,
+            iexact,
+            ignore_ownership,
+        ):
             """
             Find and import experiments data from many directories.
 
@@ -952,6 +1042,9 @@ class LocalDataImporter(BaseImporter):
             else:
                 files_data = {}
 
+            if symlink and ignore_ownership:
+                click.secho("--ignore-ownership isnt used when --symlink.", fg="yellow")
+
             matched, summary = cls().import_data(
                 directories=directories,
                 symlink=symlink,
@@ -959,6 +1052,8 @@ class LocalDataImporter(BaseImporter):
                 key=key,
                 files_data=files_data,
                 dtypes=dtypes,
+                iexact=iexact,
+                ignore_ownership=ignore_ownership,
                 **filters,
             )
 
@@ -966,5 +1061,149 @@ class LocalDataImporter(BaseImporter):
 
             if not commit and matched:  # pragma: no cover
                 utils.echo_add_commit_message()
+
+        return cmd
+
+
+class LocalYamlDataImporter(LocalDataImporter):
+    def import_data_from_yaml(
+        self,
+        symlink=False,
+        commit=False,
+        files_data=None,
+        ignore_ownership=False,
+        **filters,
+    ):
+        utils.check_admin()
+        experiments_matched = []
+        files_to_import = []
+
+        # retrieve the experiment
+        experiments = api.get_instances("experiments", verbose=True, **filters)
+        assert (
+            len(experiments) == 1
+        ), f"{len(experiments)} experiments retrieved when expected only 1"
+        experiment = experiments[0]
+
+        assert (
+            experiment["raw_data"] is None and len(experiment["bam_files"]) == 0
+        ), f"Experiment already has data"
+
+        # to reuse import_files method, creating a new dictionary w/o absolute paths
+        modified_files_data = {}
+
+        # get files to import
+        with open(files_data) as file:
+            files_data_yaml = yaml.load(file, Loader=yaml.FullLoader)
+
+            for file_to_be_imported in files_data_yaml.keys():
+                # verify files listed in yaml actually exist
+                assert os.path.exists(
+                    file_to_be_imported
+                ), f"File {file_to_be_imported} does not exist"
+
+                # check file ownership, if applicable
+                if not ignore_ownership and not symlink:
+                    utils.assert_same_owner(file_to_be_imported)
+
+                # determine if valid data type
+                dtypes = [i(file_to_be_imported) for i in self.RAW_DATA_INSPECTORS]
+                dtypes = set(i for i in dtypes if i)
+                assert len(dtypes) == 1  # happens if no data type matched
+                files_to_import.append(
+                    {"path": file_to_be_imported, "dtype": dtypes.pop()}
+                )
+
+                modified_files_data[basename(file_to_be_imported)] = files_data_yaml[
+                    file_to_be_imported
+                ]
+
+        # import experiment if commit is set to true and there are files to import
+        if commit and files_to_import:
+            experiments_matched.append(
+                self.import_files(
+                    instance=experiment,
+                    files=files_to_import,
+                    symlink=symlink,
+                    files_data=modified_files_data,
+                )
+            )
+        else:
+            experiments_matched = [experiment]
+
+        return self.get_summary(
+            files_to_import, experiment, commit, experiments_matched
+        )
+
+    @staticmethod
+    def get_summary(files, experiment, commit, matched):
+        summary = (
+            f"\n\nFor experiment '{experiment.system_id}' "
+            f"linked to sample '{experiment.sample.identifier}', "
+            f"{click.style('IMPORTED ' if commit else 'WOULD HAVE IMPORTED ', fg='cyan', bold=True)}"
+        )
+        summary += f"the following {len(files)} files:"
+
+        for file in files:
+            summary += f"\n\t {click.style('->', fg='yellow', bold=True)} {file}"
+
+        if not commit and matched:
+            summary += click.style(
+                "\n\nAdd --commit to proceed.\n", fg="green", blink=True
+            )
+
+        return summary
+
+    @classmethod
+    def as_cli_command(cls):
+        """Get data importer as a click command line interface."""
+
+        # build isabl_cli command and return it
+        @click.command(name="import-data-from-yaml")
+        @options.FILTERS
+        @options.COMMIT
+        @options.SYMLINK
+        @options.FILES_DATA
+        @click.option("--ignore-ownership", help="Don't check ownership.", is_flag=True)
+        def cmd(commit, filters, symlink, files_data, ignore_ownership):
+            """
+            Import data into an experiment by specifying a path to a
+            files_data yaml file. The files_data yaml file must contain
+            absolute file paths.
+
+            files_data.yaml structure:
+            The top level key needs to be an absolute path to a file,
+            while the values can be whatever data is relevant to the person importing.
+
+            \b
+            \b
+            Example of files_data yaml structure:
+                \b
+                absolute/path/to/file/file_name_1.some_extension      <-- top level key
+                    key_1: value_1                                    <-- top level value
+                    key_2: value_2                                    <-- top level value
+                absolute/path/to/file/file_name_2.some_extension      <-- top level key
+                    key_1: value_1                                    <-- top level value
+                    key_2: value_2                                    <-- top level value
+                ...
+            """
+
+            # verify yaml file exits
+            assert os.path.exists(
+                files_data
+            ), f"The following files_data yaml path '{files_data}' does not exist."
+
+            if symlink and ignore_ownership:
+                click.secho("--ignore-ownership isnt used when --symlink.", fg="yellow")
+
+            summary = cls().import_data_from_yaml(
+                symlink=symlink,
+                commit=commit,
+                files_data=files_data,
+                ignore_ownership=ignore_ownership,
+                **filters,
+            )
+
+            click.echo(summary)
 
         return cmd

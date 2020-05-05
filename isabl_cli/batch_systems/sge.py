@@ -8,9 +8,9 @@ from os.path import dirname
 from os.path import join
 import os
 import random
-import re
 import subprocess
 
+from slugify import slugify
 import click
 
 from isabl_cli import api
@@ -19,7 +19,28 @@ from isabl_cli.settings import system_settings
 from isabl_cli.settings import perform_import
 
 
-def submit_lsf(app, command_tuples):  # pragma: no cover
+# catch kill signal using -notify in qsub
+COMMAND = """
+#!/bin/sh
+
+sigusr2()
+{{
+  echo kill signal catched
+  ({exit_command}) &> {exit_log}
+}}
+
+# catch -USR2 signal
+trap sigusr2 USR2
+
+# run the command
+{command}
+
+# reset to be elegant
+trap - USR2
+"""
+
+
+def submit_sge(app, command_tuples):  # pragma: no cover
     """Submit applications as arrays grouped by the target methods."""
     groups = defaultdict(list)
 
@@ -54,10 +75,8 @@ def submit_lsf(app, command_tuples):  # pragma: no cover
         try:
             api.patch_analyses_status(analyses, "SUBMITTED")
             submit_configuration = system_settings.SUBMIT_CONFIGURATION
-
-            # LSF may not like arrays bigger thank 10K
             for i in api.chunks(commands, 10000):
-                submit_lsf_array(
+                submit_sge_array(
                     commands=i,
                     requirements=requirements or "",
                     extra_args=submit_configuration.get("extra_args", ""),
@@ -76,7 +95,7 @@ def submit_lsf(app, command_tuples):  # pragma: no cover
     return [(i, "SUBMITTED") for i, _ in command_tuples]
 
 
-def submit_lsf_array(
+def submit_sge_array(
     commands, requirements, jobname, extra_args=None, throttle_by=50, wait=False
 ):  # pragma: no cover
     """
@@ -90,7 +109,7 @@ def submit_lsf_array(
     Arguments:
         commands (list): of (path to bash script, on exit command) tuples.
         requirements (str): string of LSF requirements.
-        jobname (str): lsf array jobname.
+        jobname (str): sge array jobname.
         extra_args (str): extra LSF args.
         throttle_by (int): max number of jobs running at same time.
         wait (bool): if true, wait until clean command finishes.
@@ -108,9 +127,10 @@ def submit_lsf_array(
         datetime.now(system_settings.TIME_ZONE).isoformat(),
     )
 
-    wait = "-K" if wait else ""
+    wait = "-sync y" if wait else ""
     os.makedirs(root, exist_ok=True)
-    jobname += " | rundir: {}".format(root)
+    jobname += "-rundir: {}".format(root)
+    jobname = slugify(jobname)
     total = len(commands)
     index = 0
 
@@ -121,38 +141,38 @@ def submit_lsf_array(
 
             with open(join(root, "in.%s" % index), "w") as f:
                 # use random sleep to avoid parallel API hits
-                f.write(f"sleep {random.uniform(0, 10):.3} && bash {command}")
-
-            with open(join(root, "exit_cmd.%s" % index), "w") as f:
-                f.write(exit_command)
+                f.write(
+                    COMMAND.format(
+                        exit_command=exit_command,
+                        exit_log=join(rundir, "head_job.exit"),
+                        command=f"sleep {random.uniform(0, 10):.3} && bash {command}",
+                    )
+                )
 
             for j in "log", "err", "exit":
-                src = join(rundir, "head_job.{}".format(j))
-                dst = join(root, "{}.{}".format(j, index))
+                src = join(rundir, f"head_job.{j}")
+                dst = join(root, f"{j}.{index}")
                 open(src, "w").close()
                 utils.force_symlink(src, dst)
 
-    # submit array of commands
+    with open(join(root, "in.sh"), "w") as f:
+        f.write("bash in.${SGE_TASK_ID}")
+
+    with open(join(root, "clean.sh"), "w") as f:
+        f.write(f"rm -rf {root}")
+
     cmd = (
-        f"bsub {requirements} {extra_args} "
-        f'-J "ISABL | {jobname}[1-{total}]%{throttle_by}" '
-        f'-oo "{root}/log.%I" -eo "{root}/err.%I" -i "{root}/in.%I" bash'
+        f"qsub {requirements} {extra_args} -tc {throttle_by} -t 1-{total} "
+        f'-N "ISABL-{jobname}" -notify -terse -wd {root} '
+        f"-o 'log.$TASK_ID' -e 'err.$TASK_ID' {root}/in.sh"
     )
 
     jobid = subprocess.check_output(cmd, shell=True).decode("utf-8")
-    jobid = re.findall("<(.*?)>", jobid)[0]
+    jobid = jobid.strip().split(".")[0]
 
-    # submit array of exit commands
-    # -ti, or immediate termination, prevents orphan jobs when -w is not valid anymore
     cmd = (
-        f'bsub -W 15 -J "EXIT | {jobname}[1-{total}]" -ti -o "{root}/exit.%I" '
-        f'-w "exit({jobid}[*])" -i "{root}/exit_cmd.%I" bash '
+        f'qsub -N "CLEAN-{jobname}" -hold_jid {jobid} {wait} -terse '
+        f"-o /dev/null -e /dev/null {root}/clean.sh"
     )
 
-    jobid = subprocess.check_output(cmd, shell=True).decode("utf-8")
-    jobid = re.findall("<(.*?)>", jobid)[0]
-
-    # clean the execution directory
-    cmd = f'bsub -J "CLEAN | {jobname}" -w "ended({jobid})" -ti {wait} rm -r {root}'
-    jobid = subprocess.check_output(cmd, shell=True).decode("utf-8")
-    return re.findall("<(.*?)>", jobid)[0]
+    return subprocess.check_output(cmd, shell=True).decode("utf-8").strip()
