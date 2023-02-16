@@ -1,10 +1,9 @@
 from os.path import isfile
 from os.path import join
-import os
 import uuid
 
+from cached_property import cached_property
 from click.testing import CliRunner
-import click
 import pytest
 
 from isabl_cli import AbstractApplication
@@ -12,10 +11,8 @@ from isabl_cli import api
 from isabl_cli import exceptions
 from isabl_cli import factories
 from isabl_cli import options
-from isabl_cli import utils
 from isabl_cli.settings import _DEFAULTS
 from isabl_cli.settings import get_application_settings
-from isabl_cli.settings import system_settings
 
 
 class NonSequencingApplication(AbstractApplication):
@@ -28,6 +25,9 @@ class ExperimentsFromDefaulCLIApplication(AbstractApplication):
 
     NAME = str(uuid.uuid4())
     VERSION = "STILL_TESTING"
+    ASSEMBLY = "GRCh4000"
+    SPECIES = "HUMAN"
+
     cli_options = [
         options.TARGETS,
         options.ANALYSES,
@@ -37,16 +37,15 @@ class ExperimentsFromDefaulCLIApplication(AbstractApplication):
         options.NULLABLE_REFERENCES,
     ]
 
-    def validate_experiments(self, targets, refereces):
-        assert "raise validation error" not in targets.notes
+    def validate_experiments(self, targets, references):
+        assert not any("raise validation error" in target.notes for target in targets)
 
-    def get_command(**_):
+    def get_command(*_): # pylint: disable=no-method-argument
         return ""
 
 
 class MockApplication(AbstractApplication):
 
-    pass
     NAME = str(uuid.uuid4())
     VERSION = "STILL_TESTING"
     ASSEMBLY = "GRCh4000"
@@ -425,11 +424,14 @@ def test_engine(tmpdir):
     assert f"{experiments[0].system_id} has no registered bedfile" in str(error.value)
 
     # test that get results work as expected
-    assert application.get_results(
-        result_key="analysis_result_key",
-        experiment=target,
-        application_key=application.primary_key,
-    ) == [(1, ran_analyses[1][0].pk)]
+    assert (
+        application.get_results(
+            result_key="analysis_result_key",
+            experiment=target,
+            application_key=application.primary_key,
+        )
+        == [(1, ran_analyses[1][0].pk)]
+    )
 
     # check assertion error is raised when an invalid result is searched for
     with pytest.raises(AssertionError) as error:
@@ -720,12 +722,34 @@ def test_validate_same_technique():
     assert "Expected one technique, got:" in str(error.value)
 
 
+def test_validate_same_platform():
+    application = AbstractApplication()
+    targets = [{"system_id": 1, "platform": {"slug": "1"}}]
+    references = [{"system_id": 2, "platform": {"slug": "1"}}]
+    application.validate_same_platform(targets, references)
+
+    with pytest.raises(AssertionError) as error:
+        targets = [{"system_id": 1, "platform": {"slug": "2"}}]
+        application.validate_same_platform(targets, references)
+
+    assert "Same platforms required" in str(error.value)
+
+    with pytest.raises(AssertionError) as error:
+        references.append({"system_id": 3, "platform": {"slug": "2"}})
+        application.validate_same_platform(targets, references)
+
+    assert "Expected one platform, got:" in str(error.value)
+
+
 def test_get_experiments_from_default_cli_options(tmpdir):
     app = ExperimentsFromDefaulCLIApplication()
-    experiments = [
-        api.create_instance("experiments", **factories.ExperimentFactory())
-        for i in range(4)
-    ]
+
+    experiments = []
+    for i in range(4):
+        experiment_factory = factories.ExperimentFactory()
+        experiment_factory["sample"]["individual"]["species"] = "HUMAN"
+        experiments.append(api.create_instance("experiments", **experiment_factory))
+
     analysis = api.create_instance(
         "analyses",
         **{
@@ -738,38 +762,237 @@ def test_get_experiments_from_default_cli_options(tmpdir):
     pairs_file = tmpdir.join("pairs.txt")
     pairs_file.write(experiments[1].system_id + "\t" + experiments[0].system_id + "\n")
 
+    command = ExperimentsFromDefaulCLIApplication.as_cli_command()
+    runner = CliRunner()
+
+    args = [
+        "--pair",
+        experiments[0].system_id,
+        experiments[1].system_id,
+        "--pairs",
+        experiments[2].system_id,
+        experiments[3].system_id,
+        "--targets-filters",
+        "pk",
+        experiments[3].pk,
+        "--references-filters",
+        "pk",
+        experiments[2].pk,
+        "--analyses-filters",
+        "pk",
+        analysis.pk,
+        "--pairs-from-file",
+        str(pairs_file),
+    ]
+
     # get coverage for invalid experiments
     api.patch_instance(
         "experiments", experiments[0].system_id, notes="raise validation error"
     )
-
-    command = ExperimentsFromDefaulCLIApplication.as_cli_command()
-    runner = CliRunner()
-    result = runner.invoke(
-        command,
-        [
-            "--pair",
-            experiments[0].system_id,
-            experiments[1].system_id,
-            "--pairs",
-            experiments[2].system_id,
-            experiments[3].system_id,
-            "--targets-filters",
-            "pk",
-            experiments[3].pk,
-            "--references-filters",
-            "pk",
-            experiments[2].pk,
-            "--analyses-filters",
-            "pk",
-            analysis.pk,
-            "--pairs-from-file",
-            str(pairs_file),
-        ],
-        catch_exceptions=False,
-    )
+    result = runner.invoke(command, args, catch_exceptions=False)
     assert experiments[0].system_id in result.output
-    assert "INVALID" in result.output
+    assert "RAN 3 | SKIPPED 0 | INVALID 2" in result.output, result.output
+
+    # revalidate experiment on existing analysis
+    api.patch_instance("experiments", experiments[0].system_id, notes="")
+    result = runner.invoke(command, args, catch_exceptions=False)
+    assert experiments[0].system_id in result.output
+    assert "RAN 5 | SKIPPED 0 | INVALID 0" in result.output
 
     # just get coverage for get_job_name
     assert ExperimentsFromDefaulCLIApplication.get_job_name(analysis)
+
+
+def test_validate_individuals():
+    # Test matched analyis
+    matched_application = AbstractApplication()
+
+    targets = [
+        {"system_id": 1, "sample": {"individual": {"pk": 1, "system_id": "ind1"}}}
+    ]
+    references = [
+        {"system_id": 2, "sample": {"individual": {"pk": 1, "system_id": "ind1"}}}
+    ]
+    matched_application.validate_individuals(targets, references)
+
+    with pytest.raises(AssertionError) as error:
+        targets = [
+            {"system_id": 1, "sample": {"individual": {"pk": 2, "system_id": "ind2"}}}
+        ]
+        matched_application.validate_individuals(targets, references)
+    assert "Same individual required:" in str(error.value)
+
+    # Test unmatched analysis
+    unmatched_application = AbstractApplication()
+    unmatched_application.IS_UNMATCHED = True
+
+    targets = [
+        {"system_id": 1, "sample": {"individual": {"pk": 1, "system_id": "ind1"}}}
+    ]
+    references = [
+        {"system_id": 2, "sample": {"individual": {"pk": 2, "system_id": "ind2"}}}
+    ]
+    unmatched_application.validate_individuals(targets, references)
+
+    with pytest.raises(AssertionError) as error:
+        targets = [
+            {"system_id": 1, "sample": {"individual": {"pk": 2, "system_id": "ind2"}}}
+        ]
+        unmatched_application.validate_individuals(targets, references)
+    assert "Different individuals required:" in str(error.value)
+
+
+def test_notify_project_analyst():
+    # Test notification for project analysts
+    application = MockApplication()
+
+    project = api.create_instance("projects", **factories.ProjectFactory())
+    project["analyst"]
+    experiments = [factories.ExperimentFactory(projects=[project]) for i in range(4)]
+    experiments = [api.create_instance("experiments", **i) for i in experiments]
+    analysis = api.create_instance(
+        "analyses",
+        **{
+            **factories.AnalysisFactory(),
+            "targets": experiments,
+            "references": experiments,
+        },
+    )
+
+    assert application.notify_project_analyst(analysis, "test", "test").ok
+
+
+######## Test App Dependencies ###########
+
+
+class MockFirstVersion(MockApplication):
+    NAME = "PRE-PROCESSING"
+    VERSION = "v1"
+
+    def get_analysis_results(self, analysis):
+        return {"analysis_result_key": 1}
+
+
+class MockSecondVersion(MockApplication):
+    NAME = "PRE-PROCESSING"
+    VERSION = "v2"
+
+    def get_analysis_results(self, analysis):
+        return {"analysis_result_key": 2}
+
+
+class PostMockApp(MockApplication):
+    application_inputs = {"dependency_key": NotImplemented}
+
+    def get_command(self, analysis, inputs, settings):
+        assert inputs["dependency_key"] == 1
+        return f"echo {analysis['targets'][0]['system_id']}"
+
+    def get_analysis_results(self, analysis):
+        return {"analysis_result_key": 3}
+
+
+class PostMockAppWithFirstFixedDependency(PostMockApp):
+    NAME = "POST-PROCESSING FIXED"
+    VERSION = "DEPENDS ON PRE-PROCESSING v1"
+
+    @cached_property
+    def dependencies_results(self):
+        return [
+            {
+                "app": MockFirstVersion(),
+                "result": "analysis_result_key",
+                "name": "dependency_key",
+            }
+        ]
+
+
+class PostMockAppWithSecondFixedDependency(PostMockApp):
+    NAME = "POST-PROCESSING FIXED"
+    VERSION = "DEPENDS ON PRE-PROCESSING v2"
+
+    @cached_property
+    def dependencies_results(self):
+        return [
+            {
+                "app": MockSecondVersion(),
+                "result": "analysis_result_key",
+                "name": "dependency_key",
+            }
+        ]
+
+
+class PostMockAppWithFlexibleDependency(PostMockApp):
+    NAME = "POST-PROCESSING FLEXIBLE"
+    VERSION = "DEPENDS ON PRE-PROCESSING, ANY VERSION"
+
+    @cached_property
+    def dependencies_results(self):
+        return [
+            {
+                "app_name": "PRE-PROCESSING",
+                "result": "analysis_result_key",
+                "name": "dependency_key",
+            }
+        ]
+
+
+class PostMockAppWithFlexibleDependencyNoLinked(PostMockAppWithFlexibleDependency):
+    VERSION = "DEPENDS ON PRE-PROCESSING, ANY VERSION. NO LINK"
+
+    @cached_property
+    def dependencies_results(self):
+        return [
+            {
+                "app_name": "PRE-PROCESSING",
+                "result": "analysis_result_key",
+                "name": "dependency_key",
+                "linked": False,
+            }
+        ]
+
+
+def test_get_dependencies():
+    individual = factories.IndividualFactory(species="HUMAN")
+    sample = factories.SampleFactory(individual=individual)
+    project = api.create_instance("projects", **factories.ProjectFactory())
+    experiment = factories.ExperimentFactory(
+        identifier="test-experiment", sample=sample, projects=[project]
+    )
+    experiment = api.create_instance("experiments", **experiment)
+    tuples = [([experiment], [])]
+
+    # Run dependency first
+    application = MockFirstVersion()
+    ran_analyses, _, __ = application.run(tuples, commit=True)
+    preprocess_analysis, status = ran_analyses[0]
+    assert status == "SUCCEEDED"
+
+    experiment = api.get_instance("experiments", experiment.system_id)
+    tuples = [([experiment], [])]
+
+    # A) App with fixed dependency succeeds
+    application = PostMockAppWithFirstFixedDependency()
+    ran_analyses, _, __ = application.run(tuples, commit=True)
+    _, status = ran_analyses[0]
+    assert status == "SUCCEEDED"
+
+    # B) App with newer version dependency invalid, because version is strict
+    application = PostMockAppWithSecondFixedDependency()
+    _, _, invalid_analyses = application.run(tuples, commit=True)
+    _, validation_error = invalid_analyses[0]
+    assert "No results found for application" in validation_error.message
+
+    # C) App with newer version dependency succeeds, because version is flexible
+    application = PostMockAppWithFlexibleDependency()
+    ran_analyses, _, __ = application.run(tuples, commit=True)
+    analysis, status = ran_analyses[0]
+    assert status == "SUCCEEDED"
+    assert analysis.analyses[0] == preprocess_analysis.pk
+
+    # New analysis doesn't link the previous analyses to it's run
+    application = PostMockAppWithFlexibleDependencyNoLinked()
+    ran_analyses, _, __ = application.run(tuples, commit=True)
+    analysis, status = ran_analyses[0]
+    assert status == "SUCCEEDED"
+    assert not analysis.analyses

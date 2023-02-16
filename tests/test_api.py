@@ -116,3 +116,9 @@ def test_get_instances():
     assert api.get_projects([project.pk])[0].pk == project.pk
     assert api.get_tree(individual.pk).pk == individual.pk
     assert api.get_trees([individual.pk])[0].pk == individual.pk
+
+
+def test_send_error_email():
+    # Test notification for errors
+    assert api.send_error_email(["test@test.com"], "test", "test").ok
+    assert api.send_error_email(["test1@test.com","test2@test.com"], "test", "test").ok

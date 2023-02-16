@@ -88,6 +88,8 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
     # to NotImplemented is considered required and must be resolved at get_dependencies
     application_inputs = dict()
 
+    dependencies_results = []
+
     # It is possible to create applications that are unique at the individual level.
     # A good example of a unique per individual application could be a patient centric
     # report that aggregates results across all samples. Applications that require a
@@ -118,17 +120,17 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
     _command_err_key = "command_err"
     _base_results = {
         _command_script_key: {
-            "frontend_type": "text-file",
+            "frontend_type": "ansi",
             "description": "Script used to execute the analysis.",
             "verbose_name": "Analysis Script",
         },
         _command_log_key: {
-            "frontend_type": "text-file",
+            "frontend_type": "ansi",
             "description": "Analysis standard output.",
             "verbose_name": "Standard Output",
         },
         _command_err_key: {
-            "frontend_type": "text-file",
+            "frontend_type": "ansi",
             "description": "Analysis standard error.",
             "verbose_name": "Standard Error",
         },
@@ -1000,7 +1002,8 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
             system_settings.api_username,
             "Ran app",
             {
-                "analyses": analyses,
+                "analyses": analyses[:200],
+                "total": len(analyses),
                 "submitter": submitter,
                 "valid": len(command_tuples),
                 "invalid": len(skipped_tuples),
@@ -1033,12 +1036,16 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
         status = self._get_after_completion_status(analysis)
 
         # build and write command
+        tmpdir = os.getenv("TMP", "/tmp")
+        tmpdir = " && ".join(
+            f"export {i}={tmpdir}" for i in ["TMP", "TMPDIR", "TMP_DIR"]
+        )
         failed = self.get_patch_status_command(analysis["pk"], "FAILED")
         started = self.get_patch_status_command(analysis["pk"], "STARTED")
         finished = self.get_patch_status_command(analysis["pk"], status)
         command = (
-            f"umask g+wrx && date && cd {outdir} && "
-            f"{started} && {command} && {finished}"
+            f"umask g+wrx && date && cd {outdir} && {tmpdir} && "
+            f"{started} && {command} && {finished} && date"
         )
 
         with open(self.get_command_script_path(analysis), "w") as f:
@@ -1060,7 +1067,10 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
 
     def _get_dependencies(self, targets, references):
         missing = []
-        analyses, inputs = self.get_dependencies(targets, references, self.settings)
+        if self.dependencies_results:
+            analyses, inputs = self._get_dependencies_results(targets, references)
+        else:
+            analyses, inputs = self.get_dependencies(targets, references, self.settings)
 
         for i, j in self.application_inputs.items():  # pragma: no cover
             if i not in inputs:
@@ -1074,6 +1084,50 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
             raise exceptions.ConfigurationError(
                 f"Required inputs missing from `get_dependencies`: {missing}"
             )
+
+        return analyses, inputs
+
+    def _get_dependencies_results(self, targets, references):
+        """
+        Get dependencies' results from a defined application version.
+
+        It's called when `self.dependencies_results` is an array containing an object:
+            {
+                result (str): Result key `Application.results.result_key`.
+                name (str): Name the result will have in the inputs objects.
+                app (obj): `Application` instance.
+                app_name (str): `Application.name`.
+                app_version (str): `Application.version`. If not defined, use
+                    any available. Use `any` if you want to use the latest available.
+                linked (bool): if False, the analysis is not linked as a dependencie of
+                    the analysis. As adding new dependencies to an analysis forces isabl
+                    to not recognize existing ones (Default: True).
+            }
+        """
+        inputs = {}
+        analyses = []
+        for dependency in self.dependencies_results:
+            result_args = {
+                "result_key": dependency["result"],
+                "targets": targets,
+                "references": references,
+            }
+            # Match app by name, and optionally by version
+            if dependency.get("app_name"):
+                result_args["application_name"] = dependency.get("app_name")
+                if "version" in dependency:
+                    result_args["application_version"] = dependency.get("app_version")
+            else:
+                # Match app by primary key
+                result_args["application_key"] = dependency.get("app").primary_key
+                result_args["application_name"] = dependency.get("app").NAME
+
+            input_name = dependency.get("name")
+            inputs[input_name], key = self.get_result(targets[0], **result_args)
+
+            if not "linked" in dependency or dependency["linked"]:
+                # Avoid linking the analysis as dependency to avoid creating new runs.
+                analyses.append(key)
 
         return analyses, inputs
 
@@ -1388,6 +1442,23 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
                 fg="yellow",
             )
 
+        # validate existing analyses
+        with click.progressbar(
+            existing_analyses,
+            file=sys.stderr,
+            label=f"Validating tuples of the {len(existing_analyses)} existing analyses...\t\t",
+        ) as bar:
+            for i in bar:
+                try:
+                    self.validate_experiments(i["targets"], i["references"])
+                    created_analyses.append(i)
+                except (
+                    exceptions.ValidationError,
+                    AssertionError,
+                ) as error:  # pragma: no cover
+                    invalid_tuples.append((i, exceptions.ValidationError(*error.args)))
+
+        # create new analyses and validate
         with click.progressbar(
             valid_tuples,
             file=sys.stderr,
@@ -1396,7 +1467,7 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
             for i in bar:
                 try:
                     targets, references, analyses, inputs, individual = i
-                    self.validate_species(targets + references)
+                    # self.validate_species(targets + references)
                     self.validate_experiments(targets, references)
                     analysis = self._patch_analysis(
                         api.create_instance(
@@ -1414,7 +1485,7 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
                 except (exceptions.ValidationError, AssertionError) as error:
                     invalid_tuples.append((i, exceptions.ValidationError(*error.args)))
 
-        return existing_analyses + created_analyses, invalid_tuples
+        return created_analyses, invalid_tuples
 
     def get_existing_analyses(self, tuples):
         """
@@ -1477,30 +1548,31 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
         tuples_map = {i[-1].pk: i for i in tuples}
         existing = {}
 
-        for i in api.get_analyses(
-            application=self.application.pk,
-            individual_level_analysis__pk__in=",".join(map(str, tuples_map)),
-        ):
-            individual = i.individual_level_analysis
-            current_tuple = tuples_map[individual.pk]
+        if tuples_map:
+            for i in api.get_analyses(
+                application=self.application.pk,
+                individual_level_analysis__pk__in=",".join(map(str, tuples_map)),
+            ):
+                individual = i.individual_level_analysis
+                current_tuple = tuples_map[individual.pk]
 
-            # make sure we only have one analysis per individual
-            assert individual.pk not in existing, f"Multiple analyses for {individual}"
-            existing[individual.pk] = i
+                # make sure we only have one analysis per individual
+                assert individual.pk not in existing, f"Multiple analyses for {individual}"
+                existing[individual.pk] = i
 
-            # patch analysis if tuples differ
-            for ix, key in enumerate(["targets", "references", "analyses"]):
-                if {getattr(j, "pk", j) for j in i[key]} != {
-                    getattr(j, "pk", j) for j in current_tuple[ix]
-                }:
-                    existing[individual.pk] = api.patch_instance(
-                        "analyses",
-                        i.pk,
-                        targets=current_tuple[0],
-                        references=current_tuple[1],
-                        analyses=current_tuple[2],
-                    )
-                    break
+                # patch analysis if tuples differ
+                for ix, key in enumerate(["targets", "references", "analyses"]):
+                    if {getattr(j, "pk", j) for j in i[key]} != {
+                        getattr(j, "pk", j) for j in current_tuple[ix]
+                    }:
+                        existing[individual.pk] = api.patch_instance(
+                            "analyses",
+                            i.pk,
+                            targets=current_tuple[0],
+                            references=current_tuple[1],
+                            analyses=current_tuple[2],
+                        )
+                        break
 
         return list(existing.values()), [i for i in tuples if i[-1].pk not in existing]
 
@@ -1678,6 +1750,14 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
         assert len(ttec) == 1, f"Expected one technique, got: {ttec}"
         assert rtec == ttec, f"Same techniques required: {ttec}, {rtec}."
 
+    def validate_same_platform(self, targets, references):
+        """Validate targets and references are sequenced on the same platform."""
+        tpla = {i["platform"]["slug"] for i in targets}
+        rpla = {i["platform"]["slug"] for i in references}
+        assert len(rpla) == 1, f"Expected one platform, got: {rpla}"
+        assert len(tpla) == 1, f"Expected one platform, got: {tpla}"
+        assert rpla == tpla, f"Same platforms required: {tpla}, {rpla}."
+
     def validate_species(self, experiments):
         """Validate experiments's species is same as application's setting."""
         msg = []
@@ -1693,3 +1773,62 @@ class AbstractApplication:  # pylint: disable=too-many-public-methods
         for i in experiments:
             msg = f"Experiment Sample {i.sample.system_id} is not NORMAL."
             assert i.sample.category == "NORMAL", msg
+
+    def validate_individuals(self, targets, references):
+        """
+        Validate pairs are of the same individual if the pipeline is matched;
+        Validate pairs are of the different individuals if the pipeline is unmatched.
+        """
+        if references:
+            targets_set = list(
+                {v["sample"]["individual"]["pk"]: v for v in targets}.values()
+            )
+            references_set = list(
+                {v["sample"]["individual"]["pk"]: v for v in references}.values()
+            )
+
+            assert len(targets_set) == 1, "One unique target individual is supported."
+            assert (
+                len(references_set) == 1
+            ), "One unique reference individual is supported."
+
+            tind = targets_set[0]["sample"]["individual"]
+            rind = references_set[0]["sample"]["individual"]
+
+            if (
+                hasattr(self, "IS_UNMATCHED") and self.IS_UNMATCHED
+            ):  # pylint: disable=no-member
+                assert tind["pk"] != rind["pk"], (
+                    "Different individuals required: "
+                    f"{tind['system_id']} and {rind['system_id']} "
+                    "are of the same individual."
+                )
+            else:  # application is designed for matched analyses
+                assert tind["pk"] == rind["pk"], (
+                    "Same individual required: "
+                    f"{tind['system_id']} and {rind['system_id']} "
+                    "are of different individuals."
+                )
+
+    # -------------------------
+    # NOTIFICATION UTILS
+    # -------------------------
+
+    def notify_project_analyst(self, analysis, subject, message):
+        """
+        Send email notification to analysts of projects associated with specified analysis.
+        """
+        projects = []
+        for target in analysis.targets:
+            projects.extend(target.projects)
+        analysts = set([project.analyst for project in projects if project.analyst])
+        if not analysts:
+            click.secho(
+                "Skipping notification as projects have no registered analysts",
+                fg="red",
+            )
+            return
+        kwargs = {
+            "data": {"recipients": analysts, "subject": subject, "content": message}
+        }
+        return api.api_request("post", url=f"/send_email", **kwargs)

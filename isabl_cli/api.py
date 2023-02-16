@@ -185,7 +185,7 @@ def chunks(array, size):
 def get_api_url(url):
     """Get an API URL."""
     # hmm, don't like this messing around with slashes
-    base_url = environ.get("ISABL_API_URL", "http://0.0.0.0:8000/api/v1/")
+    base_url = environ.get("ISABL_API_URL", "http://localhost:8000/api/v1/")
     base_url = base_url if base_url[-1] == "/" else f"{base_url}/"
 
     if not url.startswith(base_url):
@@ -332,7 +332,7 @@ def process_api_filters(**filters):
             if key == "fields" and "pk" not in value:  # pk is required
                 value = ",".join(value.split(",") + ["pk"])
             filters_dict[key] = value
-        elif isinstance(value, collections.Iterable):
+        elif isinstance(value, collections.abc.Iterable):
             is_in = key.endswith("__in") or key.endswith("__in!")
             value = list(map(str, value))
             filters_dict[key] = [",".join(value)] if is_in else value
@@ -645,6 +645,29 @@ def patch_analysis_status(analysis, status):
     return patch_instance("analyses", analysis["pk"], **data)
 
 
+def send_error_email(recipients, subject, message):
+    """
+    Sends an error message to recipients.
+
+    Arguments:
+        recipients (list): email recipients.
+        subject (str): email subject.
+        message (str): error message.
+
+    Returns:
+        requests.models.Response: api request response.
+    """
+    kwargs = {
+        "data": {
+            "recipients": recipients,
+            "subject": subject,
+            "content": message,
+            "html_template": "error",
+        }
+    }
+    return api_request("post", url=f"/send_email", **kwargs)
+
+
 def _set_analysis_permissions(analysis):
     protect_results = analysis.status == "SUCCEEDED"
     unique_analysis_per_individual = False
@@ -679,7 +702,15 @@ def _set_analysis_permissions(analysis):
             src = analysis.storage_url + "__tmp"
             shutil.move(analysis.storage_url, src)
             cmd = utils.get_rsync_command(src, analysis.storage_url, chmod="a-w")
-            subprocess.check_call(cmd, shell=True)
+            try:
+                subprocess.check_call(cmd, shell=True)
+            except subprocess.CalledProcessError:
+                try:
+                    version_stdout = subprocess.check_call(["rsync", "--version"], shell=True).split("\n")[0]
+                    utils.check_rsync_version(version_stdout)
+                except Exception as e:
+                    click.secho(f"Error running rsync and checking its version", fg="red")
+                    raise(e)
         else:
             subprocess.check_call(["chmod", "-R", "a-w", analysis.storage_url])
 
